@@ -34,13 +34,22 @@ using namespace Microsoft::WRL;
 namespace fs = std::filesystem;
 
 // ========================================================================
-// JSON String Unescaping Helper (Fixes Escaped Slashes in WebView2)
+// Metadata Struct
+// ========================================================================
+struct TrackMetadata {
+    std::string artist;
+    std::string title;
+    std::string album;
+    unsigned int year = 0;
+};
+
+// ========================================================================
+// JSON String Unescaping Helper
 // ========================================================================
 std::string UnescapeJsonString(const std::string& input) {
     if (input.empty() || input == "null" || input == "\"\"") return "";
 
     std::string s = input;
-    // Strip leading and trailing quotes from JSON string representation
     while (s.length() >= 2 && s.front() == '\"' && s.back() == '\"') {
         s = s.substr(1, s.length() - 2);
     }
@@ -78,6 +87,42 @@ std::string UnescapeJsonString(const std::string& input) {
         }
     }
     return result;
+}
+
+TrackMetadata ParseMetadataJson(const std::string& json) {
+    TrackMetadata meta;
+    if (json.empty()) return meta;
+
+    auto extractVal = [&](const std::string& key) -> std::string {
+        size_t pos = json.find("\"" + key + "\":");
+        if (pos == std::string::npos) pos = json.find("\"" + key + "\" :");
+        if (pos == std::string::npos) return "";
+        size_t start = json.find("\"", pos + key.length() + 3);
+        if (start == std::string::npos) return "";
+        size_t end = json.find("\"", start + 1);
+        while (end != std::string::npos && json[end - 1] == '\\') {
+            end = json.find("\"", end + 1);
+        }
+        if (end == std::string::npos) return "";
+        return UnescapeJsonString(json.substr(start + 1, end - start - 1));
+        };
+
+    meta.title = extractVal("title");
+    meta.artist = extractVal("artist");
+    meta.album = extractVal("album");
+
+    size_t yearPos = json.find("\"year\":");
+    if (yearPos != std::string::npos) {
+        size_t valStart = json.find_first_of("0123456789", yearPos);
+        if (valStart != std::string::npos) {
+            try {
+                meta.year = std::stoul(json.substr(valStart));
+            }
+            catch (...) {}
+        }
+    }
+
+    return meta;
 }
 
 // ========================================================================
@@ -130,22 +175,218 @@ std::string UrlEncode(CURL* curl, const std::string& text) {
 }
 
 // ========================================================================
-// Standalone Image Loader (Supports WebP/PNG/JPG & detaches stream memory)
+// Image Converter & Format Helpers (Converts WebP/PNG/BMP to JPEG)
 // ========================================================================
-Gdiplus::Bitmap* LoadBitmapFromMemory(std::vector<char>& data) {
+std::string DetectImageMimeType(const std::vector<char>& data) {
+    if (data.size() >= 3 &&
+        static_cast<unsigned char>(data[0]) == 0xFF &&
+        static_cast<unsigned char>(data[1]) == 0xD8 &&
+        static_cast<unsigned char>(data[2]) == 0xFF) {
+        return "image/jpeg";
+    }
+    if (data.size() >= 8 &&
+        static_cast<unsigned char>(data[0]) == 0x89 &&
+        data[1] == 'P' && data[2] == 'N' && data[3] == 'G') {
+        return "image/png";
+    }
+    return "image/jpeg";
+}
+
+std::vector<char> ConvertImageToJpeg(const std::vector<char>& inputData) {
+    if (inputData.empty()) return {};
+
+    // Check if input is already valid JPEG
+    if (inputData.size() >= 3 &&
+        static_cast<unsigned char>(inputData[0]) == 0xFF &&
+        static_cast<unsigned char>(inputData[1]) == 0xD8 &&
+        static_cast<unsigned char>(inputData[2]) == 0xFF) {
+        return inputData;
+    }
+
+    // 1. Try WIC Conversion (Supports WEBP, PNG, BMP, GIF, JPEG)
+    IWICImagingFactory* pFactory = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pFactory));
+
+    if (SUCCEEDED(hr) && pFactory) {
+        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, inputData.size());
+        if (hMem) {
+            void* pMem = GlobalLock(hMem);
+            if (pMem) {
+                memcpy(pMem, inputData.data(), inputData.size());
+                GlobalUnlock(hMem);
+
+                IStream* pStream = nullptr;
+                if (CreateStreamOnHGlobal(hMem, FALSE, &pStream) == S_OK) {
+                    IWICBitmapDecoder* pDecoder = nullptr;
+                    if (SUCCEEDED(pFactory->CreateDecoderFromStream(pStream, NULL, WICDecodeMetadataCacheOnDemand, &pDecoder))) {
+                        IWICBitmapFrameDecode* pFrame = nullptr;
+                        if (SUCCEEDED(pDecoder->GetFrame(0, &pFrame))) {
+                            UINT width = 0, height = 0;
+                            pFrame->GetSize(&width, &height);
+
+                            if (width > 0 && height > 0) {
+                                IStream* pOutStream = nullptr;
+                                CreateStreamOnHGlobal(NULL, TRUE, &pOutStream);
+                                if (pOutStream) {
+                                    IWICBitmapEncoder* pEncoder = nullptr;
+                                    if (SUCCEEDED(pFactory->CreateEncoder(GUID_ContainerFormatJpeg, NULL, &pEncoder))) {
+                                        if (SUCCEEDED(pEncoder->Initialize(pOutStream, WICBitmapEncoderNoCache))) {
+                                            IWICBitmapFrameEncode* pNewFrame = nullptr;
+                                            IPropertyBag2* pPropertybag = nullptr;
+
+                                            if (SUCCEEDED(pEncoder->CreateNewFrame(&pNewFrame, &pPropertybag))) {
+                                                pNewFrame->Initialize(pPropertybag);
+                                                pNewFrame->SetSize(width, height);
+                                                WICPixelFormatGUID format = GUID_WICPixelFormat24bppBGR;
+                                                pNewFrame->SetPixelFormat(&format);
+
+                                                IWICFormatConverter* pConverter = nullptr;
+                                                if (SUCCEEDED(pFactory->CreateFormatConverter(&pConverter))) {
+                                                    if (SUCCEEDED(pConverter->Initialize(pFrame, GUID_WICPixelFormat24bppBGR,
+                                                        WICBitmapDitherTypeNone, NULL, 0.0, WICBitmapPaletteTypeCustom))) {
+                                                        pNewFrame->WriteSource(pConverter, NULL);
+                                                        pNewFrame->Commit();
+                                                        pEncoder->Commit();
+
+                                                        STATSTG statstg;
+                                                        pOutStream->Stat(&statstg, STATFLAG_NONAME);
+                                                        ULONG jpegSize = statstg.cbSize.LowPart;
+
+                                                        if (jpegSize > 0) {
+                                                            HGLOBAL hOutMem = NULL;
+                                                            GetHGlobalFromStream(pOutStream, &hOutMem);
+                                                            if (hOutMem) {
+                                                                void* pOutBytes = GlobalLock(hOutMem);
+                                                                if (pOutBytes) {
+                                                                    std::vector<char> resultData(
+                                                                        static_cast<char*>(pOutBytes),
+                                                                        static_cast<char*>(pOutBytes) + jpegSize
+                                                                    );
+                                                                    GlobalUnlock(hOutMem);
+
+                                                                    pConverter->Release();
+                                                                    pNewFrame->Release();
+                                                                    pEncoder->Release();
+                                                                    pOutStream->Release();
+                                                                    pFrame->Release();
+                                                                    pDecoder->Release();
+                                                                    pStream->Release();
+                                                                    GlobalFree(hMem);
+                                                                    pFactory->Release();
+                                                                    return resultData;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    pConverter->Release();
+                                                }
+                                                pNewFrame->Release();
+                                            }
+                                            pEncoder->Release();
+                                        }
+                                        pOutStream->Release();
+                                    }
+                                }
+                            }
+                            pFrame->Release();
+                        }
+                        pDecoder->Release();
+                    }
+                    pStream->Release();
+                }
+                GlobalFree(hMem);
+            }
+        }
+        pFactory->Release();
+    }
+
+    // 2. Fallback using GDI+ Encoder
+    HGLOBAL hMemGdi = GlobalAlloc(GMEM_MOVEABLE, inputData.size());
+    if (hMemGdi) {
+        void* pMem = GlobalLock(hMemGdi);
+        if (pMem) {
+            memcpy(pMem, inputData.data(), inputData.size());
+            GlobalUnlock(hMemGdi);
+
+            IStream* pGdiStream = nullptr;
+            if (CreateStreamOnHGlobal(hMemGdi, FALSE, &pGdiStream) == S_OK) {
+                Gdiplus::Bitmap* bmp = Gdiplus::Bitmap::FromStream(pGdiStream);
+                if (bmp && bmp->GetLastStatus() == Gdiplus::Ok) {
+                    UINT num = 0, size = 0;
+                    Gdiplus::GetImageEncodersSize(&num, &size);
+                    if (size > 0) {
+                        std::vector<BYTE> codecBuffer(size);
+                        Gdiplus::ImageCodecInfo* pCodecs = reinterpret_cast<Gdiplus::ImageCodecInfo*>(codecBuffer.data());
+                        Gdiplus::GetImageEncoders(num, size, pCodecs);
+                        CLSID jpegClsid = { 0 };
+                        for (UINT j = 0; j < num; ++j) {
+                            if (wcscmp(pCodecs[j].MimeType, L"image/jpeg") == 0) {
+                                jpegClsid = pCodecs[j].Clsid;
+                                break;
+                            }
+                        }
+
+                        IStream* pOutGdiStream = nullptr;
+                        CreateStreamOnHGlobal(NULL, TRUE, &pOutGdiStream);
+                        if (pOutGdiStream) {
+                            if (bmp->Save(pOutGdiStream, &jpegClsid, NULL) == Gdiplus::Ok) {
+                                STATSTG statstg;
+                                pOutGdiStream->Stat(&statstg, STATFLAG_NONAME);
+                                ULONG gdiSize = statstg.cbSize.LowPart;
+                                if (gdiSize > 0) {
+                                    HGLOBAL hOutMem = NULL;
+                                    GetHGlobalFromStream(pOutGdiStream, &hOutMem);
+                                    if (hOutMem) {
+                                        void* pOutBytes = GlobalLock(hOutMem);
+                                        if (pOutBytes) {
+                                            std::vector<char> resultData(
+                                                static_cast<char*>(pOutBytes),
+                                                static_cast<char*>(pOutBytes) + gdiSize
+                                            );
+                                            GlobalUnlock(hOutMem);
+                                            delete bmp;
+                                            pOutGdiStream->Release();
+                                            pGdiStream->Release();
+                                            GlobalFree(hMemGdi);
+                                            return resultData;
+                                        }
+                                    }
+                                }
+                            }
+                            pOutGdiStream->Release();
+                        }
+                    }
+                    delete bmp;
+                }
+                pGdiStream->Release();
+            }
+            GlobalFree(hMemGdi);
+        }
+    }
+
+    return inputData;
+}
+
+// ========================================================================
+// Standalone Image Loader (Supports WebP/PNG/JPG Preview)
+// ========================================================================
+Gdiplus::Bitmap* LoadBitmapFromMemory(const std::vector<char>& data) {
     if (data.empty()) return nullptr;
 
     HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, data.size());
     if (!hMem) return nullptr;
 
     void* pMem = GlobalLock(hMem);
+    if (!pMem) {
+        GlobalFree(hMem);
+        return nullptr;
+    }
     memcpy(pMem, data.data(), data.size());
     GlobalUnlock(hMem);
 
-    // 1. Try WIC decoding first (handles JPG, PNG, WEBP, BMP, GIF consistently)
+    // 1. Try WIC decoding first
     IWICImagingFactory* pFactory = nullptr;
-    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
-        IID_PPV_ARGS(&pFactory));
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pFactory));
 
     IStream* pStream = nullptr;
     if (CreateStreamOnHGlobal(hMem, FALSE, &pStream) == S_OK && pFactory) {
@@ -176,56 +417,6 @@ Gdiplus::Bitmap* LoadBitmapFromMemory(std::vector<char>& data) {
                                 pConverter->CopyPixels(NULL, stride, bufferSize, static_cast<BYTE*>(bmpData.Scan0));
                                 wicBmp->UnlockBits(&bmpData);
 
-                                // Convert in-memory image to standard JPEG bytes for TagLib ID3 APIC compatibility
-                                IWICBitmapEncoder* pEncoder = nullptr;
-                                IStream* pOutStream = nullptr;
-                                CreateStreamOnHGlobal(NULL, TRUE, &pOutStream);
-
-                                if (pOutStream && SUCCEEDED(pFactory->CreateEncoder(GUID_ContainerFormatJpeg, NULL, &pEncoder))) {
-                                    if (SUCCEEDED(pEncoder->Initialize(pOutStream, WICBitmapEncoderNoCache))) {
-                                        IWICBitmapFrameEncode* pNewFrame = nullptr;
-                                        IPropertyBag2* pPropertybag = nullptr;
-
-                                        if (SUCCEEDED(pEncoder->CreateNewFrame(&pNewFrame, &pPropertybag))) {
-                                            pNewFrame->Initialize(pPropertybag);
-                                            pNewFrame->SetSize(width, height);
-                                            WICPixelFormatGUID format = GUID_WICPixelFormat24bppBGR;
-                                            pNewFrame->SetPixelFormat(&format);
-
-                                            IWICFormatConverter* pJpegConverter = nullptr;
-                                            pFactory->CreateFormatConverter(&pJpegConverter);
-                                            if (pJpegConverter) {
-                                                pJpegConverter->Initialize(pFrame, GUID_WICPixelFormat24bppBGR,
-                                                    WICBitmapDitherTypeNone, NULL, 0.0, WICBitmapPaletteTypeCustom);
-                                                pNewFrame->WriteSource(pJpegConverter, NULL);
-                                                pJpegConverter->Release();
-                                            }
-
-                                            pNewFrame->Commit();
-                                            pNewFrame->Release();
-                                        }
-                                        pEncoder->Commit();
-                                        pEncoder->Release();
-
-                                        STATSTG statstg;
-                                        pOutStream->Stat(&statstg, STATFLAG_NONAME);
-                                        ULONG jpegSize = statstg.cbSize.LowPart;
-
-                                        if (jpegSize > 0) {
-                                            HGLOBAL hOutMem = NULL;
-                                            GetHGlobalFromStream(pOutStream, &hOutMem);
-                                            if (hOutMem) {
-                                                void* pOutBytes = GlobalLock(hOutMem);
-                                                if (pOutBytes) {
-                                                    data.assign(static_cast<char*>(pOutBytes), static_cast<char*>(pOutBytes) + jpegSize);
-                                                    GlobalUnlock(hOutMem);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    pOutStream->Release();
-                                }
-
                                 pConverter->Release();
                                 pFrame->Release();
                                 pDecoder->Release();
@@ -249,13 +440,12 @@ Gdiplus::Bitmap* LoadBitmapFromMemory(std::vector<char>& data) {
     if (pFactory) pFactory->Release();
     if (pStream) pStream->Release();
 
-    // 2. Fallback to standard GDI+ with Clone (standalone pixel copy)
+    // 2. Fallback to standard GDI+ with Clone
     IStream* pGdiStream = nullptr;
     Gdiplus::Bitmap* resultBmp = nullptr;
     if (CreateStreamOnHGlobal(hMem, FALSE, &pGdiStream) == S_OK) {
         Gdiplus::Bitmap* tmpBmp = Gdiplus::Bitmap::FromStream(pGdiStream);
         if (tmpBmp && tmpBmp->GetLastStatus() == Gdiplus::Ok) {
-            // Clone tmpBmp to create a standalone bitmap independent of pGdiStream and hMem!
             resultBmp = tmpBmp->Clone(0, 0, tmpBmp->GetWidth(), tmpBmp->GetHeight(), PixelFormat32bppPARGB);
         }
         if (tmpBmp) delete tmpBmp;
@@ -271,7 +461,10 @@ Gdiplus::Bitmap* LoadBitmapFromMemory(std::vector<char>& data) {
 // ========================================================================
 struct WebScrapeResult {
     std::string appleArtUrl;
+    TrackMetadata appleMeta;
+
     std::string spotifyArtUrl;
+    TrackMetadata spotifyMeta;
 };
 
 // ========================================================================
@@ -447,6 +640,36 @@ public:
                     break;
                 }
             }
+
+            std::wstring findAppleMetaScript = L"(() => { "
+                L"  let title = '', artist = '', album = '', year = 0; "
+                L"  let ogTitle = document.querySelector('meta[property=\"og:title\"]'); "
+                L"  if (ogTitle && ogTitle.content) { "
+                L"    let t = ogTitle.content; "
+                L"    if (t.includes(' - Album by ')) { "
+                L"      let parts = t.split(' - Album by '); "
+                L"      album = parts[0].trim(); "
+                L"      artist = parts[1].split(' - ')[0].replace(' on Apple Music', '').trim(); "
+                L"    } else if (t.includes(' by ')) { "
+                L"      let parts = t.split(' by '); "
+                L"      title = parts[0].trim(); "
+                L"      artist = parts[1].replace(' on Apple Music', '').split(' - ')[0].trim(); "
+                L"    } "
+                L"  } "
+                L"  let h1 = document.querySelector('h1'); "
+                L"  if (h1 && h1.textContent) { "
+                L"    if (!title && !album) title = h1.textContent.trim(); "
+                L"  } "
+                L"  let artistEl = document.querySelector('a[href*=\"/artist/\"]'); "
+                L"  if (artistEl && artistEl.textContent && !artist) artist = artistEl.textContent.trim(); "
+                L"  let bodyText = document.body.innerText || ''; "
+                L"  let yearMatch = bodyText.match(/\\b(19|20)\\d{2}\\b/); "
+                L"  if (yearMatch) year = parseInt(yearMatch[0]); "
+                L"  return JSON.stringify({ title: title, artist: artist, album: album, year: year }); "
+                L"})()";
+
+            std::string metaJson = ExecuteScriptSync(findAppleMetaScript);
+            res.appleMeta = ParseMetadataJson(metaJson);
         }
 
         // ==========================================================
@@ -512,6 +735,38 @@ public:
                     break;
                 }
             }
+
+            std::wstring findSpotifyMetaScript = L"(() => { "
+                L"  let title = '', artist = '', album = '', year = 0; "
+                L"  let ogTitle = document.querySelector('meta[property=\"og:title\"]'); "
+                L"  if (ogTitle && ogTitle.content) { "
+                L"    let t = ogTitle.content; "
+                L"    if (t.includes(' - song and lyrics by ')) { "
+                L"      let parts = t.split(' - song and lyrics by '); "
+                L"      title = parts[0].trim(); "
+                L"      artist = parts[1].replace(' | Spotify', '').trim(); "
+                L"    } else if (t.includes(' - song by ')) { "
+                L"      let parts = t.split(' - song by '); "
+                L"      title = parts[0].trim(); "
+                L"      artist = parts[1].replace(' | Spotify', '').trim(); "
+                L"    } else if (t.includes(' - Album by ')) { "
+                L"      let parts = t.split(' - Album by '); "
+                L"      album = parts[0].trim(); "
+                L"      artist = parts[1].replace(' | Spotify', '').trim(); "
+                L"    } else { "
+                L"      title = t.replace(' | Spotify', '').trim(); "
+                L"    } "
+                L"  } "
+                L"  let artistEl = document.querySelector('a[data-testid=\"creator-link\"], a[href*=\"/artist/\"]'); "
+                L"  if (artistEl && artistEl.textContent && !artist) artist = artistEl.textContent.trim(); "
+                L"  let bodyText = document.body.innerText || ''; "
+                L"  let yearMatch = bodyText.match(/\\b(19|20)\\d{2}\\b/); "
+                L"  if (yearMatch) year = parseInt(yearMatch[0]); "
+                L"  return JSON.stringify({ title: title, artist: artist, album: album, year: year }); "
+                L"})()";
+
+            std::string metaJson = ExecuteScriptSync(findSpotifyMetaScript);
+            res.spotifyMeta = ParseMetadataJson(metaJson);
         }
 
         return res;
@@ -791,6 +1046,7 @@ int main(int argc, char* argv[]) {
                 if (picFrame) {
                     TagLib::ByteVector bv = picFrame->picture();
                     localArtData.assign(bv.data(), bv.data() + bv.size());
+                    localArtData = ConvertImageToJpeg(localArtData);
                 }
             }
         }
@@ -808,6 +1064,7 @@ int main(int argc, char* argv[]) {
         if (!scrapeRes.appleArtUrl.empty()) {
             std::cout << "   [+] Downloading Apple Artwork: " << scrapeRes.appleArtUrl << "\n";
             appleArtData = DownloadImageToMemory(curl, scrapeRes.appleArtUrl);
+            appleArtData = ConvertImageToJpeg(appleArtData);
         }
         else {
             std::cout << "   [-] Apple Music artwork not found.\n";
@@ -816,10 +1073,22 @@ int main(int argc, char* argv[]) {
         if (!scrapeRes.spotifyArtUrl.empty()) {
             std::cout << "   [+] Downloading Spotify Artwork: " << scrapeRes.spotifyArtUrl << "\n";
             spotifyArtData = DownloadImageToMemory(curl, scrapeRes.spotifyArtUrl);
+            spotifyArtData = ConvertImageToJpeg(spotifyArtData);
         }
         else {
             std::cout << "   [-] Spotify artwork not found.\n";
         }
+
+        // --- Prepare Metadata Displays ---
+        std::string aArtist = scrapeRes.appleMeta.artist.empty() ? localArtist : scrapeRes.appleMeta.artist;
+        std::string aTitle = scrapeRes.appleMeta.title.empty() ? localTitle : scrapeRes.appleMeta.title;
+        std::string aAlbum = scrapeRes.appleMeta.album.empty() ? localAlbum : scrapeRes.appleMeta.album;
+        unsigned int aYear = scrapeRes.appleMeta.year > 0 ? scrapeRes.appleMeta.year : localYear;
+
+        std::string sArtist = scrapeRes.spotifyMeta.artist.empty() ? localArtist : scrapeRes.spotifyMeta.artist;
+        std::string sTitle = scrapeRes.spotifyMeta.title.empty() ? localTitle : scrapeRes.spotifyMeta.title;
+        std::string sAlbum = scrapeRes.spotifyMeta.album.empty() ? localAlbum : scrapeRes.spotifyMeta.album;
+        unsigned int sYear = scrapeRes.spotifyMeta.year > 0 ? scrapeRes.spotifyMeta.year : localYear;
 
         // --- Build UI Dialog State ---
         DialogState dlgState;
@@ -830,8 +1099,8 @@ int main(int argc, char* argv[]) {
 
         std::ostringstream ltxt, atxt, stxt;
         ltxt << "Artist: " << localArtist << "\nTitle: " << localTitle << "\nAlbum: " << localAlbum << "\nYear: " << localYear;
-        atxt << "Artist: " << localArtist << "\nTitle: " << localTitle << "\nAlbum: " << localAlbum << "\nSource: " << (scrapeRes.appleArtUrl.empty() ? "Not Found" : "Apple Music");
-        stxt << "Artist: " << localArtist << "\nTitle: " << localTitle << "\nAlbum: " << localAlbum << "\nSource: " << (scrapeRes.spotifyArtUrl.empty() ? "Not Found" : "Spotify");
+        atxt << "Artist: " << aArtist << "\nTitle: " << aTitle << "\nAlbum: " << aAlbum << "\nYear: " << aYear;
+        stxt << "Artist: " << sArtist << "\nTitle: " << sTitle << "\nAlbum: " << sAlbum << "\nYear: " << sYear;
 
         dlgState.localText = ltxt.str();
         dlgState.appleText = atxt.str();
@@ -864,61 +1133,90 @@ int main(int argc, char* argv[]) {
             autoMode = true;
         }
 
-        // Select chosen artwork vector:
-        // Choice 1: Default (Local)
-        // Choice 2: Apple Music
-        // Choice 3: Spotify
-        // Choice 4: Auto All (Apple -> Spotify -> Local)
-        std::vector<char>* chosenArt = &localArtData;
+        // --- Apply Selection (Metadata + Image) ---
+        std::string finalArtist = localArtist;
+        std::string finalTitle = localTitle;
+        std::string finalAlbum = localAlbum;
+        unsigned int finalYear = localYear;
+        std::vector<char>* finalArt = &localArtData;
 
-        if (choice == 2) { // Apple
-            if (!appleArtData.empty()) {
-                chosenArt = &appleArtData;
-            }
-            else {
-                std::cout << "   [!] Selected Apple, but Apple artwork was empty. Falling back to Local.\n";
-            }
+        if (choice == 1) { // Choice 1: Default (Local)
+            finalArtist = localArtist;
+            finalTitle = localTitle;
+            finalAlbum = localAlbum;
+            finalYear = localYear;
+            finalArt = &localArtData;
         }
-        else if (choice == 3) { // Spotify
-            if (!spotifyArtData.empty()) {
-                chosenArt = &spotifyArtData;
-            }
-            else {
-                std::cout << "   [!] Selected Spotify, but Spotify artwork was empty. Falling back to Local.\n";
-            }
+        else if (choice == 2) { // Choice 2: Apple Music
+            finalArtist = aArtist;
+            finalTitle = aTitle;
+            finalAlbum = aAlbum;
+            finalYear = aYear;
+            finalArt = !appleArtData.empty() ? &appleArtData : &localArtData;
         }
-        else if (choice == 4) { // Auto All
+        else if (choice == 3) { // Choice 3: Spotify
+            finalArtist = sArtist;
+            finalTitle = sTitle;
+            finalAlbum = sAlbum;
+            finalYear = sYear;
+            finalArt = !spotifyArtData.empty() ? &spotifyArtData : &localArtData;
+        }
+        else if (choice == 4) { // Choice 4: Auto All Web
             if (!appleArtData.empty()) {
-                chosenArt = &appleArtData;
+                finalArtist = aArtist;
+                finalTitle = aTitle;
+                finalAlbum = aAlbum;
+                finalYear = aYear;
+                finalArt = &appleArtData;
             }
             else if (!spotifyArtData.empty()) {
-                chosenArt = &spotifyArtData;
+                finalArtist = sArtist;
+                finalTitle = sTitle;
+                finalAlbum = sAlbum;
+                finalYear = sYear;
+                finalArt = &spotifyArtData;
             }
             else {
-                chosenArt = &localArtData;
+                finalArt = &localArtData;
             }
         }
 
-        // --- Rebuild Tags ---
-        std::cout << "   [*] Stripping and Repairing ID3 headers...\n";
-        mpegFile.strip(TagLib::MPEG::File::AllTags);
+        // --- Rebuild Tags Cleanly ---
+        std::cout << "   [*] Stripping old headers and writing fresh ID3v2 tags...\n";
+
         TagLib::ID3v2::Tag* freshTag = mpegFile.ID3v2Tag(true);
 
-        freshTag->setArtist(TagLib::String(localArtist, TagLib::String::UTF8));
-        freshTag->setTitle(TagLib::String(localTitle, TagLib::String::UTF8));
-        freshTag->setAlbum(TagLib::String(localAlbum, TagLib::String::UTF8));
-        freshTag->setYear(localYear);
-
-        if (!chosenArt->empty()) {
-            TagLib::ID3v2::AttachedPictureFrame* picFrame = new TagLib::ID3v2::AttachedPictureFrame();
-            picFrame->setMimeType("image/jpeg");
-            picFrame->setType(TagLib::ID3v2::AttachedPictureFrame::FrontCover);
-            picFrame->setPicture(TagLib::ByteVector(chosenArt->data(), static_cast<unsigned int>(chosenArt->size())));
-            freshTag->addFrame(picFrame);
+        // Remove all old frames (TIT2, TPE1, TALB, APIC, etc.)
+        TagLib::ID3v2::FrameList oldFrames = freshTag->frameList();
+        for (TagLib::ID3v2::Frame* frame : oldFrames) {
+            freshTag->removeFrame(frame, true);
         }
 
-        if (mpegFile.save(TagLib::MPEG::File::ID3v2, TagLib::File::StripOthers, TagLib::ID3v2::v4)) {
-            std::cout << "   [+] Repaired and saved successfully.\n";
+        // Set new metadata
+        freshTag->setArtist(TagLib::String(finalArtist, TagLib::String::UTF8));
+        freshTag->setTitle(TagLib::String(finalTitle, TagLib::String::UTF8));
+        freshTag->setAlbum(TagLib::String(finalAlbum, TagLib::String::UTF8));
+        freshTag->setYear(finalYear);
+
+        // Embed Cover Art (Ensures JPEG conversion & proper MIME header)
+        if (finalArt && !finalArt->empty()) {
+            std::vector<char> artToWrite = ConvertImageToJpeg(*finalArt);
+            if (!artToWrite.empty()) {
+                std::string mimeType = DetectImageMimeType(artToWrite);
+                TagLib::ID3v2::AttachedPictureFrame* picFrame = new TagLib::ID3v2::AttachedPictureFrame();
+                picFrame->setMimeType(TagLib::String(mimeType, TagLib::String::UTF8));
+                picFrame->setType(TagLib::ID3v2::AttachedPictureFrame::FrontCover);
+                picFrame->setPicture(TagLib::ByteVector(artToWrite.data(), static_cast<unsigned int>(artToWrite.size())));
+                freshTag->addFrame(picFrame);
+            }
+        }
+
+        // Save ID3v2 tag (ID3v2.3 for broad compatibility across players/car systems)
+        if (mpegFile.save(TagLib::MPEG::File::ID3v2, TagLib::File::StripOthers, TagLib::ID3v2::v3)) {
+            std::cout << "   [+] Repaired and saved successfully (Artist: " << finalArtist << ", Title: " << finalTitle << ", Album: " << finalAlbum << ").\n";
+        }
+        else {
+            std::cerr << "   [!] Failed to save ID3v2 tag to file.\n";
         }
     }
 
