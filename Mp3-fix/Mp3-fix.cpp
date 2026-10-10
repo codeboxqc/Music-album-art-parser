@@ -5,6 +5,7 @@
 #include <sstream>
 #include <atomic>
 #include <algorithm>
+#include <cctype>
 
 #include <windows.h>
 #include <gdiplus.h>
@@ -42,6 +43,44 @@ struct TrackMetadata {
     std::string album;
     unsigned int year = 0;
 };
+
+// ========================================================================
+// Filename Parsing & Cleaning Helpers
+// ========================================================================
+std::string CleanFilename(const std::string& stem) {
+    std::string s = stem;
+    std::replace(s.begin(), s.end(), '_', ' ');
+
+    size_t start = 0;
+    while (start < s.length() && (isdigit(static_cast<unsigned char>(s[start])) || s[start] == ' ' || s[start] == '.' || s[start] == '-')) {
+        start++;
+    }
+    if (start >= s.length()) {
+        s = stem;
+    }
+    else if (start > 0) {
+        s = s.substr(start);
+    }
+
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) {
+        return !std::isspace(ch);
+        }));
+
+    return s;
+}
+
+void ParseFilename(const std::string& stem, std::string& outArtist, std::string& outTitle) {
+    std::string cleaned = CleanFilename(stem);
+    size_t dashPos = cleaned.find(" - ");
+    if (dashPos != std::string::npos) {
+        outArtist = cleaned.substr(0, dashPos);
+        outTitle = cleaned.substr(dashPos + 3);
+    }
+    else {
+        outArtist = "";
+        outTitle = cleaned;
+    }
+}
 
 // ========================================================================
 // JSON String Unescaping Helper
@@ -175,7 +214,7 @@ std::string UrlEncode(CURL* curl, const std::string& text) {
 }
 
 // ========================================================================
-// Image Converter & Format Helpers (Converts WebP/PNG/BMP to JPEG)
+// Image Format Converter (Converts WebP/PNG/BMP to standard JPEG)
 // ========================================================================
 std::string DetectImageMimeType(const std::vector<char>& data) {
     if (data.size() >= 3 &&
@@ -195,7 +234,7 @@ std::string DetectImageMimeType(const std::vector<char>& data) {
 std::vector<char> ConvertImageToJpeg(const std::vector<char>& inputData) {
     if (inputData.empty()) return {};
 
-    // Check if input is already valid JPEG
+    // Check if input is already JPEG
     if (inputData.size() >= 3 &&
         static_cast<unsigned char>(inputData[0]) == 0xFF &&
         static_cast<unsigned char>(inputData[1]) == 0xD8 &&
@@ -561,8 +600,16 @@ public:
         return scriptResult;
     }
 
-    WebScrapeResult ScrapeDirect(CURL* curl, const std::string& artist, const std::string& title, const std::string& album) {
+    WebScrapeResult ScrapeDirect(CURL* curl, const std::string& artist, const std::string& title, const std::string& album, const std::string& filenameStem) {
         WebScrapeResult res;
+
+        std::string effArtist = artist;
+        std::string effTitle = title;
+        std::string effAlbum = album;
+
+        if (effArtist.empty() && effTitle.empty()) {
+            ParseFilename(filenameStem, effArtist, effTitle);
+        }
 
         std::wstring findAppleAlbumLinkScript = L"(() => { "
             L"  let links = document.querySelectorAll('a[href*=\"/album/\"]'); "
@@ -591,12 +638,24 @@ public:
             L"})()";
 
         // ==========================================================
-        // 1. Apple Music (Searches by Album)
+        // 1. Apple Music (Searches by Album or Title or Clean Filename)
         // ==========================================================
-        std::string searchAlbum = album.empty() ? title : album;
-        std::string appleQuery = artist + " " + searchAlbum;
+        std::string appleQuery;
+        if (!effArtist.empty() && !effAlbum.empty()) {
+            appleQuery = effArtist + " " + effAlbum;
+        }
+        else if (!effArtist.empty() && !effTitle.empty()) {
+            appleQuery = effArtist + " " + effTitle;
+        }
+        else if (!effTitle.empty()) {
+            appleQuery = effTitle;
+        }
+        else {
+            appleQuery = CleanFilename(filenameStem);
+        }
+
         std::string appleSearchUrl = "https://music.apple.com/ca/search?term=" + UrlEncode(curl, appleQuery);
-        std::cout << "   [*] Apple Music: Loading search grid (Album)...\n";
+        std::cout << "   [*] Apple Music: Loading search grid (" << appleQuery << ")...\n";
 
         navigationComplete = false;
         std::wstring wAppleUrl(appleSearchUrl.begin(), appleSearchUrl.end());
@@ -673,12 +732,24 @@ public:
         }
 
         // ==========================================================
-        // 2. Spotify (Searches by Song Title)
+        // 2. Spotify (Searches by Song Title or Filename)
         // ==========================================================
-        std::string searchTitle = title.empty() ? album : title;
-        std::string spotifyQuery = artist + " " + searchTitle;
+        std::string spotifyQuery;
+        if (!effArtist.empty() && !effTitle.empty()) {
+            spotifyQuery = effArtist + " " + effTitle;
+        }
+        else if (!effArtist.empty() && !effAlbum.empty()) {
+            spotifyQuery = effArtist + " " + effAlbum;
+        }
+        else if (!effTitle.empty()) {
+            spotifyQuery = effTitle;
+        }
+        else {
+            spotifyQuery = CleanFilename(filenameStem);
+        }
+
         std::string spotifySearchUrl = "https://open.spotify.com/search/" + UrlEncode(curl, spotifyQuery) + "/tracks";
-        std::cout << "   [*] Spotify: Loading search grid for song title (" << searchTitle << ")...\n";
+        std::cout << "   [*] Spotify: Loading search grid (" << spotifyQuery << ")...\n";
 
         navigationComplete = false;
         std::wstring wSpotifyUrl(spotifySearchUrl.begin(), spotifySearchUrl.end());
@@ -703,6 +774,8 @@ public:
             std::wstring findSpotifyImageScript = L"(() => { "
                 L"  let meta = document.querySelector('meta[property=\"og:image\"]'); "
                 L"  if (meta && meta.content && meta.content.includes('i.scdn.co')) return meta.content; "
+                L"  let metaTw = document.querySelector('meta[name=\"twitter:image\"]'); "
+                L"  if (metaTw && metaTw.content && metaTw.content.includes('i.scdn.co')) return metaTw.content; "
                 L"  let imgTestId = document.querySelector('img[data-testid=\"cover-art-image\"]'); "
                 L"  if (imgTestId) { "
                 L"    if (imgTestId.src && imgTestId.src.includes('i.scdn.co')) return imgTestId.src; "
@@ -1012,6 +1085,7 @@ int main(int argc, char* argv[]) {
 
         fs::path srcFilePath = entry.path();
         fs::path destFilePath = outputFolder / srcFilePath.filename();
+        std::string filenameStem = srcFilePath.stem().string();
 
         std::cout << "\n----------------------------------------------------\n";
         std::cout << "[*] Processing: " << srcFilePath.filename().string() << "\n";
@@ -1039,6 +1113,11 @@ int main(int argc, char* argv[]) {
             localYear = mpegFile.tag()->year();
         }
 
+        // If local metadata is missing, parse filename for fallback display
+        if (localArtist.empty() && localTitle.empty()) {
+            ParseFilename(filenameStem, localArtist, localTitle);
+        }
+
         if (mpegFile.ID3v2Tag()) {
             const TagLib::ID3v2::FrameList& frameList = mpegFile.ID3v2Tag()->frameListMap()["APIC"];
             if (!frameList.isEmpty()) {
@@ -1058,7 +1137,7 @@ int main(int argc, char* argv[]) {
 
         if (webViewReady) {
             std::cout << "   [*] Searching Apple Music (Album) and Spotify (Song Title) via WebView2...\n";
-            scrapeRes = webScraper.ScrapeDirect(curl, localArtist, localTitle, localAlbum);
+            scrapeRes = webScraper.ScrapeDirect(curl, localArtist, localTitle, localAlbum, filenameStem);
         }
 
         if (!scrapeRes.appleArtUrl.empty()) {
